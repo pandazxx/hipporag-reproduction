@@ -56,7 +56,28 @@ Step by step:
 7. **Compute node specificity.** For each node, store 1/(passage count containing this entity).
 8. **Pickle everything.** Save the graph, the P matrix, entity embeddings, node specificities.
 
-**Cost profile:** dominated by step 1 (OpenIE). Roughly 1 LLM call per passage. At API rates, ~$0.01–$0.10 per passage; indexing 5,000 passages costs ~$50–$200.
+### Indexing cost breakdown
+
+Notation:
+- **P** = number of passages (typical: 1K–100K)
+- **T** = total triples extracted (typical: 3–10 × P)
+- **N** = unique entities after dedup (typical: 0.5–5K per 1K passages, depends on corpus diversity)
+- **D** = embedding dimension (768 for Contriever)
+
+| # | Step | Cost type | Volume | Magnitude on 5K-passage corpus |
+|---|---|---|---|---|
+| 1 | OpenIE on every passage | **LLM API call** | P calls; ~1–2K tokens in + ~200–500 tokens out per call | **Dominant cost.** GPT-3.5: ~$5–15. GPT-4o-mini: ~$3–8. GPT-4: ~$50–150. |
+| 2 | Entity deduplication | Local CPU | O(T) hashmap ops | Negligible (seconds) |
+| 3 | Entity-to-passage map (P matrix) | Local CPU | O(T) sparse-matrix inserts | Negligible (seconds) |
+| 4 | Entity encoding | **Local GPU** if Contriever local, OR **embedding API** | N embeddings; ~10 tokens per entity (entity name is short) | Local GPU on a 4060: ~30s. API: ~$0.001–0.02 (Voyage / OpenAI). |
+| 5 | All-pairs nearest neighbour (FAISS `IndexFlat`) | Local CPU | O(N²) inner products; brute-force exact | N=10K: ~5–30s on CPU. N=100K: ~minutes. |
+| 6 | Knowledge graph construction | Local CPU | O(T + N·k) where k=100 cap on synonyms per node | Negligible (seconds) |
+| 7 | Node specificity | Local CPU | O(N) counts | Negligible |
+| 8 | Pickle to disk | Local disk I/O | Final artifacts ~10–500 MB depending on N | Seconds, ~hundreds of MB disk |
+
+**Net indexing cost for a 5K-passage corpus:** dominated by step 1. Realistic total = **$5–$15 (GPT-3.5)**, **$3–$8 (GPT-4o-mini)**, **$50–$150 (GPT-4)**. All other costs are local compute + I/O, free at marginal cost if you have the hardware. Time-wise: most of the wall clock is also step 1, since API latency dominates (a few seconds per passage if not parallelised, ~1 hour for 5K passages serially).
+
+**Important:** step 1 is **easily parallelisable** — independent API calls per passage. The `openie_with_retrieval_option_parallel.py` script in the HippoRAG repo does this. Plan for 20–50 concurrent requests during indexing to keep wall clock manageable.
 
 ---
 
@@ -72,7 +93,38 @@ Step by step:
 6. **Compute passage scores.** Multiply by the `P` matrix: `p = (n_specificity_weighted)ᵀ · P`.
 7. **Return top-K passages by score.**
 
-**Cost profile:** one LLM call (step 1, the NER). PPR itself is tens of milliseconds for ~100K-node graphs. Total per-query cost is dominated by the LLM call.
+### Per-query cost breakdown
+
+Notation:
+- **q** = number of named entities extracted from a query (typical: 1–5)
+- **N** = total KG nodes (same as in indexing)
+- **E** = total edges in the combined graph (typical: 3–10 × N)
+
+| # | Step | Cost type | Volume | Magnitude per query |
+|---|---|---|---|---|
+| 1 | Query NER | **LLM API call** | 1 call; ~50–200 tokens in + ~30–100 tokens out (short list of entities) | **Dominant cost.** GPT-3.5: ~$0.0001. GPT-4o-mini: ~$0.0001. GPT-4: ~$0.001–0.005. |
+| 2 | Encode query entities | **Local GPU** OR **embedding API** | q embeddings; entities usually short | Free (local, cached embeddings if possible). API: ~$0.00001 per query. |
+| 3 | Match query entities to KG nodes | Local CPU | q × N dot products (sparse with FAISS) | < 10 ms |
+| 4 | Run Personalized PageRank | Local CPU | 20–50 power iterations × sparse mat-vec (E nonzeros each) | 10–50 ms for N ~100K |
+| 5 | Apply node specificity | Local CPU | Element-wise multiply over N | < 1 ms |
+| 6 | Multiply by P matrix → passage scores | Local CPU | Sparse mat-vec: O(non-zeros in P) | < 10 ms |
+| 7 | Top-K passages | Local CPU | O(P) partial sort | < 1 ms |
+
+**Net per-query cost:**
+- **Money:** $0.0001–$0.005 (entirely the NER LLM call).
+- **Wall clock:** ~200–700 ms (mostly LLM API latency, not computation).
+- **Local compute:** ~25–75 ms of CPU per query — trivial.
+
+**At scale (1,000 queries):** ~$0.10–$5.00. With caching of the NER results, this drops further on repeat queries.
+
+### Indexing vs query, end to end
+
+| Phase | LLM API | Embedding API | Local CPU | Local GPU | $ per unit | Frequency |
+|---|---|---|---|---|---|---|
+| **Index** | P × OpenIE call (heavy) | optional, if not using local model | KG construction, FAISS, pickle | optional, if Contriever local | $5–$150 for 5K passages | Once per corpus |
+| **Query** | 1 × NER call (light) | optional, if entities aren't cached | Match + PPR + scoring | usually unnecessary | $0.0001–$0.005 per query | Once per query |
+
+**Cost-amortisation crossover:** if you intend to handle more than ~1,000 queries against a corpus, HippoRAG's amortised cost (indexing + queries) beats most iterative retrieval methods. Below that, vanilla dense RAG is cheaper because it skips the indexing LLM bill entirely.
 
 ---
 
@@ -231,15 +283,31 @@ If `a` and `b` are L2-normalised, `||a||·||b|| = 1`, so cosine similarity colla
 
 ---
 
-## Cost economics
+## Cost economics — comparison to other retrieval methods
 
-| System | Indexing cost | Per-query LLM cost | Best when |
-|---|---|---|---|
-| **Vanilla dense RAG** | Low (embeddings only) | Zero (no LLM per query) | Single-hop questions, cost-sensitive |
-| **HippoRAG** | High (OpenIE per passage) | One small LLM call (NER) | Many queries on the same corpus; multi-hop |
-| **IRCoT (iterative)** | Low | Many LLM calls per query | Rare, when you don't index ahead |
+(Detailed per-step tables for HippoRAG live in the Phase 1 / Phase 2 sections above.)
 
-HippoRAG's advantage compounds with query volume. With 1,000 queries on a 5,000-passage corpus, HippoRAG's amortised cost beats IRCoT clearly. With a single query, vanilla dense RAG is cheapest.
+| System | Index: LLM calls | Index: local compute | Query: LLM calls | Query: local compute | Best when |
+|---|---|---|---|---|---|
+| **Vanilla dense RAG** | 0 | Embed every passage (free if local model) | 0 | Embed query + ANN lookup | Single-hop questions, low query volume, cost-sensitive |
+| **HippoRAG** | P × OpenIE (heavy) | KG + FAISS + node specificity | 1 small NER call | PPR + sparse matmul (~25–75 ms) | Many queries on the same corpus; multi-hop questions |
+| **IRCoT (iterative)** | 0 | Embed every passage | ~3–10 LLM calls per query (one per reasoning hop) | Re-embed each hop | Rare, when you don't index ahead |
+
+**Crossover heuristics (rough):**
+
+- **Under ~100 queries** on a fresh corpus: vanilla dense RAG is cheapest because HippoRAG's indexing bill (~$5–$150) isn't amortised.
+- **100–1,000 queries**: HippoRAG starts pulling ahead of IRCoT but the indexing investment is still material.
+- **Over 1,000 queries**: HippoRAG dominates both vanilla RAG (better quality on multi-hop) and IRCoT (much cheaper per query).
+
+**Where each cost type lives:**
+
+| Cost type | Indexing | Query |
+|---|---|---|
+| **LLM API** | OpenIE (heavy, parallelisable) | NER (light, ~1 small call) |
+| **Embedding API** | Optional, for entities if not using local model | Optional, for query entities |
+| **Local CPU** | Dedup, KG build, FAISS, pickle | Match, PPR, sparse mat-vec |
+| **Local GPU** | Optional, if running Contriever locally | Usually not needed |
+| **Disk** | Final pickled index | Read-only access to the pickled index |
 
 ---
 
