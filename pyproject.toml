@@ -6,8 +6,9 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    # HippoRAG legacy = original NeurIPS 2024 paper. main branch is v2 and is NOT the target.
-    "hipporag @ git+https://github.com/OSU-NLP-Group/HippoRAG@legacy",
+    # HippoRAG legacy has no setup.py/pyproject.toml — clone it manually:
+    #   git clone -b legacy https://github.com/OSU-NLP-Group/HippoRAG vendor/hipporag
+    # then run: PYTHONPATH=vendor/hipporag uv run python experiments/demo.py
     "openai<1.0",
     "networkx>=3.0",
     "numpy>=1.24",

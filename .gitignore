@@ -45,6 +45,9 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# Vendored dependencies (cloned manually, not installed via uv)
+vendor/
+
 # Project-specific
 results/raw/
 *.log
