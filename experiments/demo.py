@@ -181,6 +181,18 @@ _NER_SYSTEM = (
     "Respond with a JSON list of entities.\n"
 )
 
+# Query-side NER is broader: questions often contain no classic named entities,
+# so we also ask for key concepts needed to answer the question.
+_QUERY_NER_SYSTEM = (
+    "Your task is to extract named entities and key concepts from a question "
+    "that are useful for knowledge-graph retrieval. "
+    "Include person names, organisations, places, and domain concepts. "
+    "Respond with a JSON object: {\"named_entities\": [\"...\", ...]}\n"
+)
+
+_QUERY_NER_ONE_SHOT_Q = "Who founded the company that makes the iPhone?"
+_QUERY_NER_ONE_SHOT_A = '{"named_entities": ["iPhone", "Steve Jobs"]}'
+
 _OPENIE_SYSTEM = (
     "Your task is to construct an RDF (Resource Description Framework) graph from the "
     "given passages and named entity lists. \n"
@@ -208,6 +220,15 @@ def _ner_messages(text: str) -> list[dict]:
         {"role": "user",      "content": f"Paragraph:\n```\n{_ONE_SHOT_PASSAGE}\n```\n"},
         {"role": "assistant", "content": _ONE_SHOT_ENTITIES},
         {"role": "user",      "content": f"Paragraph:```\n{text}\n```"},
+    ]
+
+
+def _query_ner_messages(question: str) -> list[dict]:
+    return [
+        {"role": "system",    "content": _QUERY_NER_SYSTEM},
+        {"role": "user",      "content": _QUERY_NER_ONE_SHOT_Q},
+        {"role": "assistant", "content": _QUERY_NER_ONE_SHOT_A},
+        {"role": "user",      "content": question},
     ]
 
 
@@ -274,14 +295,16 @@ def extract_triples(passage: str) -> list[tuple]:
 # =============================================================================
 # QUERY NER — NIM LLM
 # Replaces [DEVIATION-3]: paper uses GPT-3.5 NER; we use LLM_MODEL via NIM.
-# Reuses the same NER prompt as the indexing pipeline.
+# Uses a broader query-specific prompt (_query_ner_messages) rather than the
+# passage NER prompt — questions often lack classic named entities so we also
+# extract key concepts (e.g. "quantum algorithms" from "who works on quantum algorithms?").
 # =============================================================================
 
 def extract_query_entities(question: str) -> list[str]:
     resp = _call(
         _nim().chat.completions.create,
         model=LLM_MODEL,
-        messages=_ner_messages(question),
+        messages=_query_ner_messages(question),
         temperature=0,
     )
     try:
