@@ -5,18 +5,52 @@ HippoRAG end-to-end demo.
 Runs the full HippoRAG indexing + retrieval pipeline on a 15-passage dataset
 and compares it to naive TF-IDF dense retrieval. Demonstrates multi-hop advantage.
 
-Deviations from the paper (clearly labelled with [DEVIATION]):
-  [DEVIATION-1] OpenIE: manually specified triples instead of GPT-3.5.
-  [DEVIATION-2] Entity embeddings: character trigram hashing instead of Contriever.
-  [DEVIATION-3] Query NER: character trigram matching instead of LLM extraction.
+Deviations from the paper:
   [DEVIATION-4] ANN: brute-force numpy dot instead of FAISS IndexFlat.
 
-Requirements: pip install numpy scipy
+Requires: uv sync  (installs openai, numpy, scipy)
+Set NVIDIA_API_KEY before running.
 """
+
+import json
+import os
+import re
+import time
+from collections import defaultdict
 
 import numpy as np
 import scipy.sparse as sp
-from collections import defaultdict
+from openai import OpenAI, RateLimitError
+
+
+# =============================================================================
+# NIM SETUP
+# =============================================================================
+
+EMBED_MODEL = "nvidia/nv-embedqa-e5-v5"
+LLM_MODEL   = "meta/llama-3.1-70b-instruct"
+
+_client: OpenAI | None = None
+
+
+def _nim() -> OpenAI:
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            base_url="https://integrate.api.nvidia.com/v1",
+            api_key=os.environ["NVIDIA_API_KEY"],
+        )
+    return _client
+
+
+def _call(fn, *args, **kwargs):
+    """Retry fn indefinitely on 429 rate-limit responses."""
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except RateLimitError:
+            print("    [429] rate-limited — retrying in 5 s …", flush=True)
+            time.sleep(5)
 
 
 # =============================================================================
@@ -41,86 +75,242 @@ PASSAGES = [
     "The Quantum Computing Lab received a $10M NSF grant in 2023.",                      # P14
 ]
 
-# [DEVIATION-1] In the paper, GPT-3.5 extracts these triples via an OpenIE prompt.
-# Here they are manually specified to keep the demo self-contained and free.
-TRIPLES_PER_PASSAGE = {
-    0:  [("Quantum Computing Lab", "founded by",   "Professor Alice Chen")],
-    1:  [("Professor Alice Chen",  "published on", "quantum error correction")],
-    2:  [("Quantum Computing Lab", "located at",   "Stanford University")],
-    3:  [("Stanford University",   "is a",         "research university")],
-    4:  [("Dr. Bob Martinez",      "works at",     "Quantum Computing Lab"),
-         ("Dr. Bob Martinez",      "works on",     "quantum algorithms")],
-    5:  [("Dr. Bob Martinez",      "supervised by","Professor Alice Chen")],
-    6:  [("quantum algorithms",    "researched at","Stanford University")],
-    7:  [("Professor Carol White", "director of",  "Physics department")],
-    8:  [("Physics department",    "hosts",        "Quantum Computing Lab")],
-    9:  [("Dr. Emily Davis",       "works at",     "Quantum Computing Lab"),
-         ("Dr. Emily Davis",       "came from",    "Google Brain")],
-    10: [("Google Brain",          "focused on",   "deep learning")],
-    11: [("Dr. Emily Davis",       "works on",     "quantum machine learning")],
-    12: [("Professor Alice Chen",  "received",     "Turing Award")],
-    13: [("Turing Award",          "given by",     "Association for Computing Machinery")],
-    14: [("Quantum Computing Lab", "received",     "NSF grant")],
-}
-
 TEST_QUESTIONS = [
     {
-        "q":       "Who supervises the researcher working on quantum algorithms?",
-        "answer":  "Professor Alice Chen",
-        "hops":    2,
-        "chain":   "quantum algorithms → Dr. Bob Martinez → Professor Alice Chen",
-        "key_passages": {4, 5},   # P4: Bob works on QA; P5: Bob supervised by Alice
-        # [DEVIATION-3] LLM would extract "quantum algorithms" as the NER entity.
-        # We specify it directly to isolate the retrieval mechanism.
-        "query_entities": ["quantum algorithms"],
+        "q":            "Who supervises the researcher working on quantum algorithms?",
+        "answer":       "Professor Alice Chen",
+        "hops":         2,
+        "chain":        "quantum algorithms → Dr. Bob Martinez → Professor Alice Chen",
+        "key_passages": {4, 5},
     },
     {
-        "q":       "What university hosts the lab that received the NSF grant?",
-        "answer":  "Stanford University",
-        "hops":    2,
-        "chain":   "NSF grant → Quantum Computing Lab → Stanford University",
-        "key_passages": {14, 2},  # P14: Lab got grant; P2: Lab at Stanford
-        "query_entities": ["NSF grant"],
+        "q":            "What university hosts the lab that received the NSF grant?",
+        "answer":       "Stanford University",
+        "hops":         2,
+        "chain":        "NSF grant → Quantum Computing Lab → Stanford University",
+        "key_passages": {14, 2},
     },
     {
-        "q":       "What award did the founder of the lab where Dr. Bob Martinez works receive?",
-        "answer":  "Turing Award",
-        "hops":    3,
-        "chain":   "Dr. Bob Martinez → Quantum Computing Lab → Professor Alice Chen → Turing Award",
+        "q":            "What award did the founder of the lab where Dr. Bob Martinez works receive?",
+        "answer":       "Turing Award",
+        "hops":         3,
+        "chain":        "Dr. Bob Martinez → Quantum Computing Lab → Professor Alice Chen → Turing Award",
         "key_passages": {4, 0, 12},
-        "query_entities": ["Dr. Bob Martinez"],
     },
     {
-        "q":       "What research field does the organization Dr. Emily Davis came from focus on?",
-        "answer":  "deep learning",
-        "hops":    2,
-        "chain":   "Dr. Emily Davis → Google Brain → deep learning",
-        "key_passages": {9, 10},  # P9: Emily came from Google Brain; P10: GB = deep learning
-        "query_entities": ["Dr. Emily Davis"],
+        "q":            "What research field does the organization Dr. Emily Davis came from focus on?",
+        "answer":       "deep learning",
+        "hops":         2,
+        "chain":        "Dr. Emily Davis → Google Brain → deep learning",
+        "key_passages": {9, 10},
     },
 ]
 
 
 # =============================================================================
-# ENTITY EMBEDDINGS (character trigram hashing)
-# [DEVIATION-2] Paper uses facebook/contriever (768-dim dense embeddings).
-# Here we use character trigrams hashed to 512 buckets — fast, no ML needed.
-# Entities sharing substrings (e.g. "quantum algorithms" vs query containing
-# that phrase) get higher cosine similarity.
+# ENTITY EMBEDDINGS — NIM API
+# Replaces [DEVIATION-2]: paper uses facebook/contriever; we use EMBED_MODEL
+# via NIM /v1/embeddings (OpenAI-compatible). No local GPU needed.
+# Synonymy-edge similarity distribution differs from Contriever — sim_threshold
+# may need retuning for a faithful reproduction.
 # =============================================================================
 
-EMBED_DIM = 512
+def embed_batch(texts: list[str], input_type: str = "passage") -> np.ndarray:
+    """Embed a list of strings; returns (N, dim) L2-normalised float64 array.
+
+    input_type: "passage" for corpus/index text, "query" for query-side lookups.
+    Required by asymmetric NIM embedding models.
+    """
+    response = _call(
+        _nim().embeddings.create,
+        model=EMBED_MODEL,
+        input=texts,
+        encoding_format="float",
+        extra_body={"input_type": input_type},
+    )
+    vecs = np.array(
+        [d.embedding for d in sorted(response.data, key=lambda x: x.index)],
+        dtype=np.float64,
+    )
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return vecs / norms
 
 
-def embed(text: str) -> np.ndarray:
-    """Character trigram bag-of-hashes embedding, L2-normalised."""
-    text = text.lower()
-    vec = np.zeros(EMBED_DIM, dtype=np.float64)
-    for i in range(max(1, len(text) - 2)):
-        gram = text[i: i + 3]
-        vec[abs(hash(gram)) % EMBED_DIM] += 1.0
-    norm = np.linalg.norm(vec)
-    return vec / norm if norm > 0 else vec
+def embed(text: str, input_type: str = "query") -> np.ndarray:
+    return embed_batch([text], input_type=input_type)[0]
+
+
+# =============================================================================
+# PROMPTS — copied from OSU-NLP-Group/HippoRAG legacy src/openie_extraction_instructions.py
+# =============================================================================
+
+_ONE_SHOT_PASSAGE = (
+    "Radio City\n"
+    "Radio City is India's first private FM radio station and was started on 3 July 2001.\n"
+    "It plays Hindi, English and regional songs.\n"
+    "Radio City recently forayed into New Media in May 2008 with the launch of a music "
+    "portal - PlanetRadiocity.com that offers music related news, videos, songs, and "
+    "other music-related features."
+)
+
+_ONE_SHOT_ENTITIES = """{\"named_entities\":
+    [\"Radio City\", \"India\", \"3 July 2001\", \"Hindi\", \"English\", \"May 2008\", \"PlanetRadiocity.com\"]
+}
+"""
+
+_ONE_SHOT_TRIPLES = """{\"triples\": [
+            [\"Radio City\", \"located in\", \"India\"],
+            [\"Radio City\", \"is\", \"private FM radio station\"],
+            [\"Radio City\", \"started on\", \"3 July 2001\"],
+            [\"Radio City\", \"plays songs in\", \"Hindi\"],
+            [\"Radio City\", \"plays songs in\", \"English\"],
+            [\"Radio City\", \"forayed into\", \"New Media\"],
+            [\"Radio City\", \"launched\", \"PlanetRadiocity.com\"],
+            [\"PlanetRadiocity.com\", \"launched in\", \"May 2008\"],
+            [\"PlanetRadiocity.com\", \"is\", \"music portal\"],
+            [\"PlanetRadiocity.com\", \"offers\", \"news\"],
+            [\"PlanetRadiocity.com\", \"offers\", \"videos\"],
+            [\"PlanetRadiocity.com\", \"offers\", \"songs\"]
+    ]
+}
+"""
+
+_NER_SYSTEM = (
+    "Your task is to extract named entities from the given paragraph. \n"
+    "Respond with a JSON list of entities.\n"
+)
+
+# Query-side NER is broader: questions often contain no classic named entities,
+# so we also ask for key concepts needed to answer the question.
+_QUERY_NER_SYSTEM = (
+    "Your task is to extract named entities and key concepts from a question "
+    "that are useful for knowledge-graph retrieval. "
+    "Include person names, organisations, places, and domain concepts. "
+    "Respond with a JSON object: {\"named_entities\": [\"...\", ...]}\n"
+)
+
+_QUERY_NER_ONE_SHOT_Q = "Who founded the company that makes the iPhone?"
+_QUERY_NER_ONE_SHOT_A = '{"named_entities": ["iPhone", "company"]}'
+
+_OPENIE_SYSTEM = (
+    "Your task is to construct an RDF (Resource Description Framework) graph from the "
+    "given passages and named entity lists. \n"
+    "Respond with a JSON list of triples, with each triple representing a relationship "
+    "in the RDF graph. \n\n"
+    "Pay attention to the following requirements:\n"
+    "- Each triple should contain at least one, but preferably two, of the named entities "
+    "in the list for each passage.\n"
+    "- Clearly resolve pronouns to their specific names to maintain clarity.\n"
+)
+
+_OPENIE_FRAME = (
+    "Convert the paragraph into a JSON dict, it has a named entity list and a triple list.\n"
+    "Paragraph:\n"
+    "```\n"
+    "{passage}\n"
+    "```\n\n"
+    "{named_entity_json}\n"
+)
+
+
+def _ner_messages(text: str) -> list[dict]:
+    return [
+        {"role": "system",    "content": _NER_SYSTEM},
+        {"role": "user",      "content": f"Paragraph:\n```\n{_ONE_SHOT_PASSAGE}\n```\n"},
+        {"role": "assistant", "content": _ONE_SHOT_ENTITIES},
+        {"role": "user",      "content": f"Paragraph:```\n{text}\n```"},
+    ]
+
+
+def _query_ner_messages(question: str) -> list[dict]:
+    return [
+        {"role": "system",    "content": _QUERY_NER_SYSTEM},
+        {"role": "user",      "content": _QUERY_NER_ONE_SHOT_Q},
+        {"role": "assistant", "content": _QUERY_NER_ONE_SHOT_A},
+        {"role": "user",      "content": question},
+    ]
+
+
+def _openie_messages(passage: str, entities: list[str]) -> list[dict]:
+    one_shot_input = _OPENIE_FRAME.format(
+        passage=_ONE_SHOT_PASSAGE,
+        named_entity_json=_ONE_SHOT_ENTITIES,
+    )
+    user_input = _OPENIE_FRAME.format(
+        passage=passage,
+        named_entity_json=json.dumps({"named_entities": entities}),
+    )
+    return [
+        {"role": "system",    "content": _OPENIE_SYSTEM},
+        {"role": "user",      "content": one_shot_input},
+        {"role": "assistant", "content": _ONE_SHOT_TRIPLES},
+        {"role": "user",      "content": user_input},
+    ]
+
+
+def _parse_json(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        if m:
+            return json.loads(m.group())
+        raise
+
+
+# =============================================================================
+# OPENIE — NIM LLM
+# Replaces [DEVIATION-1]: paper uses GPT-3.5; we use LLM_MODEL via NIM.
+# Two-step pipeline matching the original: NER first, then post-NER triple extraction.
+# =============================================================================
+
+def extract_triples(passage: str) -> list[tuple]:
+    # Step 1: NER
+    ner_resp = _call(
+        _nim().chat.completions.create,
+        model=LLM_MODEL,
+        messages=_ner_messages(passage),
+        temperature=0,
+    )
+    try:
+        entities = _parse_json(ner_resp.choices[0].message.content).get("named_entities", [])
+    except (json.JSONDecodeError, ValueError):
+        entities = []
+
+    # Step 2: post-NER OpenIE
+    ie_resp = _call(
+        _nim().chat.completions.create,
+        model=LLM_MODEL,
+        messages=_openie_messages(passage, entities),
+        temperature=0,
+    )
+    try:
+        data = _parse_json(ie_resp.choices[0].message.content)
+        return [tuple(t[:3]) for t in data.get("triples", []) if len(t) >= 3]
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+# =============================================================================
+# QUERY NER — NIM LLM
+# Replaces [DEVIATION-3]: paper uses GPT-3.5 NER; we use LLM_MODEL via NIM.
+# Uses a broader query-specific prompt (_query_ner_messages) rather than the
+# passage NER prompt — questions often lack classic named entities so we also
+# extract key concepts (e.g. "quantum algorithms" from "who works on quantum algorithms?").
+# =============================================================================
+
+def extract_query_entities(question: str) -> list[str]:
+    resp = _call(
+        _nim().chat.completions.create,
+        model=LLM_MODEL,
+        messages=_query_ner_messages(question),
+        temperature=0,
+    )
+    try:
+        return _parse_json(resp.choices[0].message.content).get("named_entities", [])
+    except (json.JSONDecodeError, ValueError):
+        return []
 
 
 # =============================================================================
@@ -134,7 +324,7 @@ def build_index(passages, triples_per_passage, sim_threshold=0.8):
     Returns a dict with:
       entities        list[str]   — all unique entities
       entity_idx      dict        — entity → integer index
-      embeddings      ndarray     — (N, EMBED_DIM) L2-normalised entity vectors
+      embeddings      ndarray     — (N, dim) L2-normalised entity vectors
       adj             csr_matrix  — (N, N) weighted adjacency (triple + synonymy edges)
       specificity     ndarray     — (N,) node specificity = 1 / |passages containing entity|
       P_matrix        csr_matrix  — (N, P) entity-to-passage presence matrix
@@ -153,12 +343,11 @@ def build_index(passages, triples_per_passage, sim_threshold=0.8):
     N = len(entities)
     print(f"  Unique entities : {N}")
 
-    # --- Step 2: embed every entity ---
-    embeddings = np.stack([embed(e) for e in entities])  # (N, EMBED_DIM)
+    # --- Step 2: embed every entity (one NIM API call for the whole batch) ---
+    print(f"  Embedding {N} entities via NIM …")
+    embeddings = embed_batch(entities)
 
-    # --- Step 3: triple edges (E) ---
-    # Each triple (s, p, o) adds a bidirectional edge between s and o.
-    # Weight = co-occurrence count (number of triples linking the pair).
+    # --- Step 3: triple edges ---
     graph: dict[tuple, float] = defaultdict(float)
     for _pidx, triples in triples_per_passage.items():
         for subj, _pred, obj in triples:
@@ -168,23 +357,20 @@ def build_index(passages, triples_per_passage, sim_threshold=0.8):
     triple_edges = len(graph) // 2
     print(f"  Triple edges    : {triple_edges}")
 
-    # --- Step 4: synonymy edges (E→) ---
+    # --- Step 4: synonymy edges ---
     # [DEVIATION-4] Paper uses FAISS IndexFlat; we use brute-force numpy.
-    # Paper uses Contriever cosine; we use trigram cosine (same formula, different vectors).
-    # Threshold default = 0.8 (same as paper).
-    sims = embeddings @ embeddings.T  # (N, N) pairwise cosine similarities
+    sims = embeddings @ embeddings.T
     syn_count = 0
     for i in range(N):
         for j in range(i + 1, N):
             if sims[i, j] >= sim_threshold:
-                # Paper: assignment (=), not addition, when synonymy edge exists
                 graph[(i, j)] = sims[i, j]
                 graph[(j, i)] = sims[i, j]
                 syn_count += 1
     print(f"  Synonymy edges  : {syn_count}  (cosine ≥ {sim_threshold})")
     print(f"  Total edges     : {triple_edges + syn_count}")
 
-    # --- Step 5: build sparse adjacency matrix ---
+    # --- Step 5: sparse adjacency matrix ---
     rows, cols, data = [], [], []
     for (i, j), w in graph.items():
         rows.append(i)
@@ -192,12 +378,12 @@ def build_index(passages, triples_per_passage, sim_threshold=0.8):
         data.append(w)
     adj = sp.csr_matrix((data, (rows, cols)), shape=(N, N), dtype=np.float64)
 
-    # --- Step 6: node specificity = 1 / |passages containing entity| ---
+    # --- Step 6: node specificity ---
     specificity = np.array(
         [1.0 / len(entity_to_passages[e]) for e in entities], dtype=np.float64
     )
 
-    # --- Step 7: P matrix (N × P) — entity appears in passage ---
+    # --- Step 7: P matrix (N × P) ---
     pr, pc = [], []
     for e, pidxs in entity_to_passages.items():
         ei = entity_idx[e]
@@ -238,12 +424,10 @@ def personalized_pagerank(
     """
     N = adj.shape[0]
 
-    # Row-normalise adj → transition matrix T
     row_sums = np.array(adj.sum(axis=1), dtype=np.float64).flatten()
     row_sums[row_sums == 0] = 1.0
-    T = sp.diags(1.0 / row_sums) @ adj   # T[i,j] = prob of walking from i → j
+    T = sp.diags(1.0 / row_sums) @ adj
 
-    # Personalisation vector s (uniform over seeds)
     s = np.zeros(N, dtype=np.float64)
     if seed_indices:
         s[seed_indices] = 1.0 / len(seed_indices)
@@ -264,17 +448,15 @@ def personalized_pagerank(
 
 def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) -> list[tuple]:
     """
-    Given a list of query entity strings (from LLM NER in the paper),
-    run PPR and return (passage_idx, score) pairs sorted by score.
+    Given query entity strings (extracted by NIM LLM), run PPR and return
+    (passage_idx, score) pairs sorted by score.
     """
     entities    = index["entities"]
-    entity_idx  = index["entity_idx"]
     embeddings  = index["embeddings"]
     adj         = index["adj"]
     specificity = index["specificity"]
     P_matrix    = index["P_matrix"]
 
-    # Match each query entity to KG nodes via embedding similarity
     seed_indices: list[int] = []
     print(f"    Seed entities:")
     for qe in query_entities:
@@ -286,13 +468,8 @@ def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) ->
         if best_idx not in seed_indices:
             seed_indices.append(best_idx)
 
-    # Personalized PageRank from seeds
     ppr = personalized_pagerank(adj, seed_indices)
-
-    # Weight by node specificity
     weighted = ppr * specificity
-
-    # Project onto passages: score[j] = sum_i weighted[i] * P[i,j]
     passage_scores = np.array(P_matrix.T.dot(weighted), dtype=np.float64).flatten()
 
     top_indices = np.argsort(-passage_scores)[:top_k]
@@ -309,7 +486,6 @@ def build_tfidf(passages: list[str]) -> tuple[dict, np.ndarray]:
     for p in passages:
         for w in _words(p):
             raw[w] += 1
-    # Keep words that appear in fewer than 80% of passages (basic IDF filter)
     n = len(passages)
     filtered = [w for w in raw if raw[w] < 0.8 * n]
     vocab = {w: i for i, w in enumerate(filtered)}
@@ -318,7 +494,6 @@ def build_tfidf(passages: list[str]) -> tuple[dict, np.ndarray]:
 
 
 def _words(text: str) -> list[str]:
-    import re
     return re.findall(r"[a-z]+", text.lower())
 
 
@@ -326,9 +501,7 @@ def _tfidf_vec(text: str, vocab: dict, n_docs: int, df: dict) -> np.ndarray:
     vec = np.zeros(len(vocab), dtype=np.float64)
     for w in _words(text):
         if w in vocab:
-            tf = 1.0
-            idf = np.log(n_docs / max(1, df[w]))
-            vec[vocab[w]] += tf * idf
+            vec[vocab[w]] += np.log(n_docs / max(1, df[w]))
     norm = np.linalg.norm(vec)
     return vec / norm if norm > 0 else vec
 
@@ -348,20 +521,29 @@ def main():
     sep = "=" * 68
 
     print(sep)
-    print("HippoRAG End-to-End Demo")
+    print("HippoRAG End-to-End Demo  (NIM-backed)")
     print(sep)
     print(f"\nCorpus: {len(PASSAGES)} passages  |  Questions: {len(TEST_QUESTIONS)}")
-    print("\nDeviations from the paper:")
-    print("  [DEVIATION-1] OpenIE triples are manually specified (not GPT-3.5).")
-    print("  [DEVIATION-2] Embeddings: char trigrams (not Contriever).")
-    print("  [DEVIATION-3] Query NER: query entities hard-coded (not LLM NER).")
+    print(f"LLM    : {LLM_MODEL}")
+    print(f"Embed  : {EMBED_MODEL}")
+    print("\nRemaining deviation from the paper:")
     print("  [DEVIATION-4] ANN: brute-force numpy (not FAISS).")
 
-    # ----- Phase 1: Indexing -----
+    # ----- Phase 1a: OpenIE via NIM LLM -----
     print(f"\n{sep}")
-    print("Phase 1 — Indexing")
+    print("Phase 1a — OpenIE  (NIM LLM)")
     print(sep)
-    index = build_index(PASSAGES, TRIPLES_PER_PASSAGE, sim_threshold=0.8)
+    triples_per_passage: dict[int, list[tuple]] = {}
+    for i, passage in enumerate(PASSAGES):
+        triples = extract_triples(passage)
+        triples_per_passage[i] = triples
+        print(f"  P{i}: {len(triples)} triple(s)  {triples}")
+
+    # ----- Phase 1b: Build index -----
+    print(f"\n{sep}")
+    print("Phase 1b — Indexing")
+    print(sep)
+    index = build_index(PASSAGES, triples_per_passage, sim_threshold=0.8)
 
     vocab, passage_vecs = build_tfidf(PASSAGES)
     print(f"  TF-IDF vocab    : {len(vocab)} terms")
@@ -371,9 +553,9 @@ def main():
     print("Phase 2 — Retrieval")
     print(sep)
 
-    hr_hit1 = 0   # at least 1 key passage in top-3
+    hr_hit1 = 0
     bl_hit1 = 0
-    hr_hit_all = 0  # ALL key passages in top-5
+    hr_hit_all = 0
     bl_hit_all = 0
 
     for qi, q_data in enumerate(TEST_QUESTIONS):
@@ -382,13 +564,16 @@ def main():
         hops   = q_data["hops"]
         chain  = q_data["chain"]
         key_p  = q_data["key_passages"]
-        q_ents = q_data["query_entities"]
 
         print(f"\n{'─'*68}")
         print(f"Q{qi+1} ({hops}-hop): {q}")
         print(f"  Answer    : {answer}")
         print(f"  Hop chain : {chain}")
         print(f"  Key passages needed: {sorted(f'P{p}' for p in key_p)}")
+
+        # NIM NER
+        q_ents = extract_query_entities(q)
+        print(f"  NIM NER   : {q_ents}")
 
         # HippoRAG
         print(f"\n  [HippoRAG]")

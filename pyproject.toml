@@ -9,13 +9,14 @@ dependencies = [
     # HippoRAG legacy has no setup.py/pyproject.toml — clone it manually:
     #   git clone -b legacy https://github.com/OSU-NLP-Group/HippoRAG vendor/hipporag
     # then run: PYTHONPATH=vendor/hipporag uv run python experiments/demo.py
-    "openai<1.0",
+    "openai>=1.0",
     "networkx>=3.0",
     "numpy>=1.24",
     "faiss-cpu>=1.7",
     "sentence-transformers>=2.2",
     "tiktoken>=0.5",
     "tqdm>=4.65",
+    "langchain-nvidia-ai-endpoints>=0.3",
 ]
 
 [dependency-groups]
