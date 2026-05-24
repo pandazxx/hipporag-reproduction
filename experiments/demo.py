@@ -191,7 +191,7 @@ _QUERY_NER_SYSTEM = (
 )
 
 _QUERY_NER_ONE_SHOT_Q = "Who founded the company that makes the iPhone?"
-_QUERY_NER_ONE_SHOT_A = '{"named_entities": ["iPhone", "Steve Jobs"]}'
+_QUERY_NER_ONE_SHOT_A = '{"named_entities": ["iPhone", "company"]}'
 
 _OPENIE_SYSTEM = (
     "Your task is to construct an RDF (Resource Description Framework) graph from the "
