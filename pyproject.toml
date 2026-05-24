@@ -1,0 +1,28 @@
+[project]
+name = "hipporag-reproduction"
+version = "0.1.0"
+description = "Reproduction of HippoRAG (NeurIPS 2024) for agent memory research"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    # HippoRAG legacy = original NeurIPS 2024 paper. main branch is v2 and is NOT the target.
+    "hipporag @ git+https://github.com/OSU-NLP-Group/HippoRAG@legacy",
+    "openai<1.0",
+    "networkx>=3.0",
+    "numpy>=1.24",
+    "faiss-cpu>=1.7",
+    "sentence-transformers>=2.2",
+    "tiktoken>=0.5",
+    "tqdm>=4.65",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29",
+    "jupyter>=1.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

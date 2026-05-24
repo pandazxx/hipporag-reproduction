@@ -29,6 +29,9 @@ env/
 ENV/
 .env
 
+# UV
+.uv/
+
 # Editors
 .idea/
 .vscode/
