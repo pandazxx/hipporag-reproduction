@@ -16,6 +16,7 @@ dependencies = [
     "sentence-transformers>=2.2",
     "tiktoken>=0.5",
     "tqdm>=4.65",
+    "langchain-nvidia-ai-endpoints>=0.3",
 ]
 
 [dependency-groups]
