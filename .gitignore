@@ -29,6 +29,9 @@ env/
 ENV/
 .env
 
+# UV
+.uv/
+
 # Editors
 .idea/
 .vscode/
@@ -41,6 +44,9 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Vendored dependencies (cloned manually, not installed via uv)
+vendor/
 
 # Project-specific
 results/raw/
