@@ -115,13 +115,18 @@ TEST_QUESTIONS = [
 # may need retuning for a faithful reproduction.
 # =============================================================================
 
-def embed_batch(texts: list[str]) -> np.ndarray:
-    """Embed a list of strings; returns (N, dim) L2-normalised float64 array."""
+def embed_batch(texts: list[str], input_type: str = "passage") -> np.ndarray:
+    """Embed a list of strings; returns (N, dim) L2-normalised float64 array.
+
+    input_type: "passage" for corpus/index text, "query" for query-side lookups.
+    Required by asymmetric NIM embedding models.
+    """
     response = _call(
         _nim().embeddings.create,
         model=EMBED_MODEL,
         input=texts,
         encoding_format="float",
+        extra_body={"input_type": input_type},
     )
     vecs = np.array(
         [d.embedding for d in sorted(response.data, key=lambda x: x.index)],
@@ -132,8 +137,8 @@ def embed_batch(texts: list[str]) -> np.ndarray:
     return vecs / norms
 
 
-def embed(text: str) -> np.ndarray:
-    return embed_batch([text])[0]
+def embed(text: str, input_type: str = "query") -> np.ndarray:
+    return embed_batch([text], input_type=input_type)[0]
 
 
 # =============================================================================
