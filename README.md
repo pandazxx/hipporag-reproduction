@@ -6,7 +6,14 @@ This is a warmup / practice reproduction as part of a larger agent memory resear
 
 ## Status
 
-🚧 Setting up. See [NOTES.md](NOTES.md) for ongoing learnings.
+🚧 Setup complete; reproduction work begins next.
+
+**For the agent picking this up:** start with [`HANDOVER.md`](HANDOVER.md). That document contains the mission, constraints, definition of done, and recommended workflow.
+
+**Reading order**:
+1. [`HANDOVER.md`](HANDOVER.md) — mission and constraints
+2. [`docs/paper-notes.md`](docs/paper-notes.md) — consolidated study of the HippoRAG paper
+3. [`NOTES.md`](NOTES.md) — working journal (currently empty template; fill as you go)
 
 ## Goals
 
