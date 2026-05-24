@@ -142,16 +142,90 @@ def embed(text: str, input_type: str = "query") -> np.ndarray:
 
 
 # =============================================================================
-# OPENIE — NIM LLM
-# Replaces [DEVIATION-1]: paper uses GPT-3.5; we use LLM_MODEL via NIM
-# /v1/chat/completions (OpenAI-compatible).
+# PROMPTS — copied from OSU-NLP-Group/HippoRAG legacy src/openie_extraction_instructions.py
 # =============================================================================
 
-_OPENIE_PROMPT = """\
-Extract subject-predicate-object triples from the passage below.
-Return only a JSON object, no explanation: {{"triples": [["subject", "predicate", "object"], ...]}}
+_ONE_SHOT_PASSAGE = (
+    "Radio City\n"
+    "Radio City is India's first private FM radio station and was started on 3 July 2001.\n"
+    "It plays Hindi, English and regional songs.\n"
+    "Radio City recently forayed into New Media in May 2008 with the launch of a music "
+    "portal - PlanetRadiocity.com that offers music related news, videos, songs, and "
+    "other music-related features."
+)
 
-Passage: {passage}"""
+_ONE_SHOT_ENTITIES = """{\"named_entities\":
+    [\"Radio City\", \"India\", \"3 July 2001\", \"Hindi\", \"English\", \"May 2008\", \"PlanetRadiocity.com\"]
+}
+"""
+
+_ONE_SHOT_TRIPLES = """{\"triples\": [
+            [\"Radio City\", \"located in\", \"India\"],
+            [\"Radio City\", \"is\", \"private FM radio station\"],
+            [\"Radio City\", \"started on\", \"3 July 2001\"],
+            [\"Radio City\", \"plays songs in\", \"Hindi\"],
+            [\"Radio City\", \"plays songs in\", \"English\"],
+            [\"Radio City\", \"forayed into\", \"New Media\"],
+            [\"Radio City\", \"launched\", \"PlanetRadiocity.com\"],
+            [\"PlanetRadiocity.com\", \"launched in\", \"May 2008\"],
+            [\"PlanetRadiocity.com\", \"is\", \"music portal\"],
+            [\"PlanetRadiocity.com\", \"offers\", \"news\"],
+            [\"PlanetRadiocity.com\", \"offers\", \"videos\"],
+            [\"PlanetRadiocity.com\", \"offers\", \"songs\"]
+    ]
+}
+"""
+
+_NER_SYSTEM = (
+    "Your task is to extract named entities from the given paragraph. \n"
+    "Respond with a JSON list of entities.\n"
+)
+
+_OPENIE_SYSTEM = (
+    "Your task is to construct an RDF (Resource Description Framework) graph from the "
+    "given passages and named entity lists. \n"
+    "Respond with a JSON list of triples, with each triple representing a relationship "
+    "in the RDF graph. \n\n"
+    "Pay attention to the following requirements:\n"
+    "- Each triple should contain at least one, but preferably two, of the named entities "
+    "in the list for each passage.\n"
+    "- Clearly resolve pronouns to their specific names to maintain clarity.\n"
+)
+
+_OPENIE_FRAME = (
+    "Convert the paragraph into a JSON dict, it has a named entity list and a triple list.\n"
+    "Paragraph:\n"
+    "```\n"
+    "{passage}\n"
+    "```\n\n"
+    "{named_entity_json}\n"
+)
+
+
+def _ner_messages(text: str) -> list[dict]:
+    return [
+        {"role": "system",    "content": _NER_SYSTEM},
+        {"role": "user",      "content": f"Paragraph:\n```\n{_ONE_SHOT_PASSAGE}\n```\n"},
+        {"role": "assistant", "content": _ONE_SHOT_ENTITIES},
+        {"role": "user",      "content": f"Paragraph:```\n{text}\n```"},
+    ]
+
+
+def _openie_messages(passage: str, entities: list[str]) -> list[dict]:
+    one_shot_input = _OPENIE_FRAME.format(
+        passage=_ONE_SHOT_PASSAGE,
+        named_entity_json=_ONE_SHOT_ENTITIES,
+    )
+    user_input = _OPENIE_FRAME.format(
+        passage=passage,
+        named_entity_json=json.dumps({"named_entities": entities}),
+    )
+    return [
+        {"role": "system",    "content": _OPENIE_SYSTEM},
+        {"role": "user",      "content": one_shot_input},
+        {"role": "assistant", "content": _ONE_SHOT_TRIPLES},
+        {"role": "user",      "content": user_input},
+    ]
 
 
 def _parse_json(text: str) -> dict:
@@ -164,15 +238,34 @@ def _parse_json(text: str) -> dict:
         raise
 
 
+# =============================================================================
+# OPENIE — NIM LLM
+# Replaces [DEVIATION-1]: paper uses GPT-3.5; we use LLM_MODEL via NIM.
+# Two-step pipeline matching the original: NER first, then post-NER triple extraction.
+# =============================================================================
+
 def extract_triples(passage: str) -> list[tuple]:
-    resp = _call(
+    # Step 1: NER
+    ner_resp = _call(
         _nim().chat.completions.create,
         model=LLM_MODEL,
-        messages=[{"role": "user", "content": _OPENIE_PROMPT.format(passage=passage)}],
+        messages=_ner_messages(passage),
         temperature=0,
     )
     try:
-        data = _parse_json(resp.choices[0].message.content)
+        entities = _parse_json(ner_resp.choices[0].message.content).get("named_entities", [])
+    except (json.JSONDecodeError, ValueError):
+        entities = []
+
+    # Step 2: post-NER OpenIE
+    ie_resp = _call(
+        _nim().chat.completions.create,
+        model=LLM_MODEL,
+        messages=_openie_messages(passage, entities),
+        temperature=0,
+    )
+    try:
+        data = _parse_json(ie_resp.choices[0].message.content)
         return [tuple(t[:3]) for t in data.get("triples", []) if len(t) >= 3]
     except (json.JSONDecodeError, ValueError):
         return []
@@ -181,25 +274,18 @@ def extract_triples(passage: str) -> list[tuple]:
 # =============================================================================
 # QUERY NER — NIM LLM
 # Replaces [DEVIATION-3]: paper uses GPT-3.5 NER; we use LLM_MODEL via NIM.
+# Reuses the same NER prompt as the indexing pipeline.
 # =============================================================================
-
-_NER_PROMPT = """\
-Extract the key named entities from this question for knowledge-graph retrieval.
-Return only a JSON object, no explanation: {{"entities": ["entity1", "entity2"]}}
-
-Question: {question}"""
-
 
 def extract_query_entities(question: str) -> list[str]:
     resp = _call(
         _nim().chat.completions.create,
         model=LLM_MODEL,
-        messages=[{"role": "user", "content": _NER_PROMPT.format(question=question)}],
+        messages=_ner_messages(question),
         temperature=0,
     )
     try:
-        data = _parse_json(resp.choices[0].message.content)
-        return data.get("entities", [])
+        return _parse_json(resp.choices[0].message.content).get("named_entities", [])
     except (json.JSONDecodeError, ValueError):
         return []
 
