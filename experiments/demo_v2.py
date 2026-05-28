@@ -2,7 +2,9 @@
 """
 HippoRAG 2 end-to-end demo (NIM-backed).
 
-Same 15-passage corpus and 4 multi-hop questions as demo.py.
+Same comparison dataset as demo.py (40 chronological memories, 22 questions
+across 7 categories — single_hop, two_hop, deep_multi_hop, implicit_conceptual,
+information_update, compositional_aggregation, absence_abstention).
 
 What HippoRAG 2 changes vs HippoRAG 1:
 
@@ -40,60 +42,14 @@ from _nim import (
     embed, embed_batch,
     extract_triples, filter_triples,
 )
+from _dataset import (
+    load_dataset, passages, memory_id_to_idx, required_indices,
+    category_expected_winners, score_retrieval, aggregate_by_category,
+    format_summary,
+)
 
-
-# =============================================================================
-# DATASET (same as demo.py)
-# =============================================================================
-
-PASSAGES = [
-    "The Quantum Computing Lab was founded by Professor Alice Chen in 2010.",             # P0
-    "Professor Alice Chen has published over 200 papers on quantum error correction.",    # P1
-    "The Quantum Computing Lab is located at Stanford University.",                       # P2
-    "Stanford University is one of the top research universities in California.",         # P3
-    "Dr. Bob Martinez works at the Quantum Computing Lab on quantum algorithms.",         # P4
-    "Dr. Bob Martinez is supervised by Professor Alice Chen.",                            # P5
-    "Quantum algorithms are a key research area at MIT and Stanford University.",         # P6
-    "Professor Carol White is the director of the Physics department at Stanford University.",  # P7
-    "The Physics department at Stanford University hosts the Quantum Computing Lab.",     # P8
-    "Dr. Emily Davis recently joined the Quantum Computing Lab from Google Brain.",       # P9
-    "Google Brain is a research division of Google focused on deep learning.",            # P10
-    "Dr. Emily Davis works on quantum machine learning algorithms.",                      # P11
-    "Professor Alice Chen received the Turing Award in 2019.",                            # P12
-    "The Turing Award is given by the Association for Computing Machinery.",              # P13
-    "The Quantum Computing Lab received a $10M NSF grant in 2023.",                       # P14
-]
-
-TEST_QUESTIONS = [
-    {
-        "q":            "Who supervises the researcher working on quantum algorithms?",
-        "answer":       "Professor Alice Chen",
-        "hops":         2,
-        "chain":        "quantum algorithms → Dr. Bob Martinez → Professor Alice Chen",
-        "key_passages": {4, 5},
-    },
-    {
-        "q":            "What university hosts the lab that received the NSF grant?",
-        "answer":       "Stanford University",
-        "hops":         2,
-        "chain":        "NSF grant → Quantum Computing Lab → Stanford University",
-        "key_passages": {14, 2},
-    },
-    {
-        "q":            "What award did the founder of the lab where Dr. Bob Martinez works receive?",
-        "answer":       "Turing Award",
-        "hops":         3,
-        "chain":        "Dr. Bob Martinez → Quantum Computing Lab → Professor Alice Chen → Turing Award",
-        "key_passages": {4, 0, 12},
-    },
-    {
-        "q":            "What research field does the organization Dr. Emily Davis came from focus on?",
-        "answer":       "deep learning",
-        "hops":         2,
-        "chain":        "Dr. Emily Davis → Google Brain → deep learning",
-        "key_passages": {9, 10},
-    },
-]
+TOP_K_ANY = 5
+TOP_K_ALL = 10
 
 
 # =============================================================================
@@ -302,14 +258,23 @@ def retrieve(
 # =============================================================================
 
 def main():
-    sep = "=" * 68
+    sep = "=" * 78
+
+    ds = load_dataset()
+    PASSAGES = passages(ds)
+    QUESTIONS = ds["questions"]
+    id_to_idx = memory_id_to_idx(ds)
+    expected = category_expected_winners(ds)
 
     print(sep)
     print("HippoRAG 2 End-to-End Demo  (NIM-backed)")
     print(sep)
-    print(f"\nCorpus: {len(PASSAGES)} passages  |  Questions: {len(TEST_QUESTIONS)}")
+    print(f"\nDataset: {ds['metadata']['name']}  v{ds['metadata']['version']}")
+    print(f"  {len(PASSAGES)} memories  |  {len(QUESTIONS)} questions  |  "
+          f"{len(expected)} categories")
     print(f"LLM    : {LLM_MODEL}")
     print(f"Embed  : {EMBED_MODEL}")
+    print(f"Top-K  : hit@{TOP_K_ANY}  |  all@{TOP_K_ALL}")
 
     print(f"\n{sep}")
     print("Phase 1 — OpenIE + Indexing")
@@ -320,54 +285,50 @@ def main():
     print("Phase 2 — Retrieval  (query→triple, recognition memory, PPR)")
     print(sep)
 
-    hits1 = 0
-    hits_all = 0
+    per_q: list[dict] = []
 
-    for qi, q_data in enumerate(TEST_QUESTIONS):
-        q       = q_data["q"]
-        answer  = q_data["answer"]
-        hops    = q_data["hops"]
-        chain   = q_data["chain"]
-        key_p   = q_data["key_passages"]
+    for qi, q in enumerate(QUESTIONS):
+        question = q["question"]
+        answer   = q["expected_answer"]
+        cat      = q["category"]
+        winner   = q["expected_winner"]
+        required = required_indices(q, id_to_idx)
+        req_ids  = q["requires_facts"]
 
-        print(f"\n{'─'*68}")
-        print(f"Q{qi+1} ({hops}-hop): {q}")
-        print(f"  Answer    : {answer}")
-        print(f"  Hop chain : {chain}")
-        print(f"  Key passages needed: {sorted(f'P{p}' for p in key_p)}")
+        print(f"\n{'─'*78}")
+        print(f"{q['id']} [{cat}, expect={winner}]: {question}")
+        print(f"  Answer   : {answer}")
+        print(f"  Required : {req_ids if req_ids else '(none — absence/abstention)'}")
 
-        print(f"\n  [HippoRAG 2 retrieval]")
-        hr = retrieve(q, index, top_k=5)
-        print(f"    Top-5 passages (PPR on passage nodes):")
-        for rank, (pidx, score) in enumerate(hr[:5]):
-            mark = "✓" if pidx in key_p else " "
-            print(f"      [{mark}] #{rank+1} P{pidx}  score={score:.5f}  "
-                  f"\"{PASSAGES[pidx][:60]}...\"")
+        print(f"  [HippoRAG 2 retrieval]")
+        hr = retrieve(question, index, top_k=TOP_K_ALL)
+        for rank, (pidx, score) in enumerate(hr[:TOP_K_ALL]):
+            mark = "✓" if pidx in required else " "
+            mid = ds["memories"][pidx]["id"]
+            print(f"    [{mark}] #{rank+1:>2} {mid}  score={score:.5f}  "
+                  f"\"{PASSAGES[pidx][:55]}...\"")
 
-        top3 = {pidx for pidx, _ in hr[:3]}
-        top5 = {pidx for pidx, _ in hr[:5]}
-        found1   = bool(key_p & top3)
-        found_all = key_p.issubset(top5)
+        top_ids = [pidx for pidx, _ in hr]
+        found_any, found_all = score_retrieval(top_ids, required, TOP_K_ANY, TOP_K_ALL)
+        per_q.append({"category": cat, "found_any": found_any, "found_all": found_all})
 
-        hits1    += int(found1)
-        hits_all += int(found_all)
+        def _icon(b):
+            return "—" if b is None else ("✓" if b else "✗")
+        print(f"  hit@{TOP_K_ANY}: {_icon(found_any)}   all@{TOP_K_ALL}: {_icon(found_all)}")
 
-        icon = "✓" if found1 else "✗"
-        print(f"\n  ≥1 key passage in top-3:  {icon}")
-
-    n = len(TEST_QUESTIONS)
+    # ----- Summary -----
     print(f"\n{sep}")
-    print("Summary")
+    print("Summary — HippoRAG 2")
     print(sep)
-    print(f"{'Metric':<42} {'HippoRAG 2':>10}")
-    print(f"{'─'*42} {'─'*10}")
-    print(f"{'≥1 key passage in top-3':<42} {hits1:>7}/{n}")
-    print(f"{'All key passages in top-5':<42} {hits_all:>7}/{n}")
+    print(format_summary(aggregate_by_category(per_q), expected, TOP_K_ANY, TOP_K_ALL))
     print(sep)
     print()
-    print("Note: HippoRAG 2 retrieval differs from v1 in three ways:")
-    print("  - Seeds come from query→triple matching + LLM filter (not query NER).")
-    print("  - Passages are graph nodes seeded at low weight via query↔passage sim.")
+    print("Note: absence_abstention questions have no requires_facts — they need a")
+    print("      QA reader to score and are reported under 'Skip' above.")
+    print("      HippoRAG 2 retrieval differs from v1 in three ways:")
+    print("        - Seeds come from query→triple + LLM filter, not query NER.")
+    print("        - Passages are graph nodes seeded by query↔passage similarity.")
+    print("        - Final ranking reads PPR off passage nodes (no specificity).")
     print("  - Final ranking reads PPR directly off passage nodes (no specificity).")
 
 

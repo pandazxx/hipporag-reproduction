@@ -1,11 +1,35 @@
 # Experiments
 
-Two end-to-end demos running on the same 15-passage toy corpus and the same
-four multi-hop questions, both backed by the NVIDIA NIM API. Layout:
+Two end-to-end demos running on the **comparison dataset** (40 chronological
+memories about a single user, 22 questions across 7 categories), both backed
+by the NVIDIA NIM API. Layout:
 
 - [`demo.py`](demo.py) — HippoRAG 1 (NeurIPS 2024, "legacy" branch)
 - [`demo_v2.py`](demo_v2.py) — HippoRAG 2 (Feb 2025, "main" branch)
 - [`_nim.py`](_nim.py) — shared NIM client + prompts (OpenIE, NER, recognition memory)
+- [`_dataset.py`](_dataset.py) — dataset loader + per-category scoring helpers
+- [`dataset.json`](dataset.json) — mirrored from
+  [pandazxx/research:topics/llm-agent-memory/comparison-dataset](https://github.com/pandazxx/research/tree/topic/further-research-e1e53be/topics/llm-agent-memory/comparison-dataset)
+
+## Dataset
+
+40 memories + 22 questions across 7 categories, designed to surface
+architectural differences between HippoRAG and A-Mem head-to-head:
+
+| Category | Expected winner | Tests |
+|---|---|---|
+| single_hop                | tie       | direct retrieval (control) |
+| two_hop                   | tie       | light multi-hop |
+| deep_multi_hop            | HippoRAG  | PPR propagation across chains |
+| implicit_conceptual       | A-Mem     | LLM-determined links |
+| information_update        | A-Mem     | memory evolution / contradiction |
+| compositional_aggregation | HippoRAG  | "list all X" |
+| absence_abstention        | tie       | recognising missing info |
+
+Scoring is retrieval-only: a question is "hit@5" if any required memory is in
+the top-5 retrieved, and "all@10" if all required memories are in the top-10.
+**absence_abstention** questions have no `requires_facts` and are reported as
+"Skip" — they need a QA reader to score properly.
 
 ## Running
 
@@ -111,12 +135,13 @@ Both demos use the same `EMBED_MODEL` (`nvidia/nv-embedqa-e5-v5`) and
 Free NIM tier: 1,000 credits on signup, 40 req/min. Wall-clock is dominated
 by rate-limiting:
 
-- v1 indexing: 30 LLM calls (15 passages × NER + OpenIE)
-- v1 retrieval: ~1 LLM call per question (query NER) + a few embedding calls
-- v2 indexing: same 30 OpenIE calls
-- v2 retrieval: 1 LLM call per question (recognition filter) + a few embeddings
+- v1 indexing: 80 LLM calls (40 memories × NER + OpenIE)
+- v1 retrieval: 22 LLM calls (one query NER per question) + a few embedding calls
+- v2 indexing: same 80 OpenIE calls
+- v2 retrieval: 22 LLM calls (one recognition filter per question) + a few embeddings
 
-A single run of either demo stays well under 100 credits.
+At 40 req/min the indexing phase takes ~2 minutes and is the wall-clock
+bottleneck. A single run of either demo stays well under 200 credits.
 
 ## See also
 
