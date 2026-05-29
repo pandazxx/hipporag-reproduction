@@ -47,6 +47,7 @@ from _dataset import (
     category_expected_winners, score_retrieval, aggregate_by_category,
     format_summary,
 )
+from _viz import render_index_overview, render_v2_trace, prepare_output_dir
 
 TOP_K_ANY = 5
 TOP_K_ALL = 10
@@ -202,25 +203,32 @@ def retrieve(
     top_k_triples: int = 10,
     passage_seed_weight: float = 0.05,
     top_k: int = 5,
-) -> list[tuple[int, float]]:
-    """HippoRAG 2 retrieval: query → top-K triples → LLM filter → PPR → passage scores."""
+) -> dict:
+    """HippoRAG 2 retrieval: query → top-K triples → LLM filter → PPR → passage scores.
+
+    Returns a trace dict with intermediate state for visualisation.
+    """
     # --- Step 1: query → triple matching ---
     q_emb = embed(query, input_type="query")
 
     if len(index["triples"]) > 0:
         triple_sims = index["triple_embs"] @ q_emb
         top_idx = np.argsort(-triple_sims)[:top_k_triples]
-        top_triples     = [(index["triples"][i][0], index["triples"][i][1], index["triples"][i][2]) for i in top_idx]
-        top_triple_sims = [float(triple_sims[i]) for i in top_idx]
+        top_triples = [(
+            index["triples"][i][0],
+            index["triples"][i][1],
+            index["triples"][i][2],
+            float(triple_sims[i]),
+        ) for i in top_idx]
     else:
-        top_triples, top_triple_sims = [], []
+        top_triples = []
 
     print(f"    Query→triple top-{len(top_triples)}:")
-    for (s, p, o), sim in zip(top_triples, top_triple_sims):
+    for s, p, o, sim in top_triples:
         print(f"      ({sim:.3f}) ({s}, {p}, {o})")
 
     # --- Step 2: recognition memory (LLM filter) ---
-    filtered = filter_triples(query, top_triples, top_k=4)
+    filtered = filter_triples(query, [(s, p, o) for s, p, o, _ in top_triples], top_k=4)
     print(f"    Recognition memory kept {len(filtered)} triple(s):")
     for s, p, o in filtered:
         print(f"      ({s}, {p}, {o})")
@@ -250,7 +258,15 @@ def retrieve(
     # --- Step 5: read passage scores ---
     passage_scores = ppr[index["N_phrase"]:]
     top_p = np.argsort(-passage_scores)[:top_k]
-    return [(int(i), float(passage_scores[i])) for i in top_p if passage_scores[i] > 0]
+    top_passages = [(int(i), float(passage_scores[i])) for i in top_p if passage_scores[i] > 0]
+
+    return {
+        "top_triples": top_triples,
+        "filtered_triples": filtered,
+        "seeds": seeds,
+        "ppr_scores": ppr,
+        "top_passages": top_passages,
+    }
 
 
 # =============================================================================
@@ -281,6 +297,14 @@ def main():
     print(sep)
     index = build_index(PASSAGES, sim_threshold=0.75)
 
+    # ----- Write index overview -----
+    memory_ids = [m["id"] for m in ds["memories"]]
+    out_dir = prepare_output_dir("v2")
+    (out_dir / "index.md").write_text(
+        render_index_overview(index, "HippoRAG 2", memory_ids, PASSAGES)
+    )
+    print(f"\n  Wrote index overview → {out_dir / 'index.md'}")
+
     print(f"\n{sep}")
     print("Phase 2 — Retrieval  (query→triple, recognition memory, PPR)")
     print(sep)
@@ -301,14 +325,19 @@ def main():
         print(f"  Required : {req_ids if req_ids else '(none — absence/abstention)'}")
 
         print(f"  [HippoRAG 2 retrieval]")
-        hr = retrieve(question, index, top_k=TOP_K_ALL)
-        for rank, (pidx, score) in enumerate(hr[:TOP_K_ALL]):
+        trace = retrieve(question, index, top_k=TOP_K_ALL)
+        for rank, (pidx, score) in enumerate(trace["top_passages"][:TOP_K_ALL]):
             mark = "✓" if pidx in required else " "
             mid = ds["memories"][pidx]["id"]
             print(f"    [{mark}] #{rank+1:>2} {mid}  score={score:.5f}  "
                   f"\"{PASSAGES[pidx][:55]}...\"")
 
-        top_ids = [pidx for pidx, _ in hr]
+        # Write per-question trace
+        (out_dir / f"{q['id']}_trace.md").write_text(
+            render_v2_trace(q, trace, index, memory_ids, PASSAGES, required)
+        )
+
+        top_ids = [pidx for pidx, _ in trace["top_passages"]]
         found_any, found_all = score_retrieval(top_ids, required, TOP_K_ANY, TOP_K_ALL)
         per_q.append({"category": cat, "found_any": found_any, "found_all": found_all})
 

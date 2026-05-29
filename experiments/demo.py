@@ -30,6 +30,7 @@ from _dataset import (
     category_expected_winners, score_retrieval, aggregate_by_category,
     format_summary,
 )
+from _viz import render_index_overview, render_v1_trace, prepare_output_dir
 
 TOP_K_ANY = 5    # "any required fact retrieved in top-K_any?"
 TOP_K_ALL = 10   # "all required facts retrieved in top-K_all?"
@@ -168,10 +169,10 @@ def personalized_pagerank(
 # HIPPORAG RETRIEVAL
 # =============================================================================
 
-def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) -> list[tuple]:
+def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) -> dict:
     """
-    Given query entity strings (extracted by NIM LLM), run PPR and return
-    (passage_idx, score) pairs sorted by score.
+    Given query entity strings (extracted by NIM LLM), run PPR and return a
+    trace dict with intermediate state for visualisation.
     """
     entities    = index["entities"]
     embeddings  = index["embeddings"]
@@ -180,6 +181,7 @@ def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) ->
     P_matrix    = index["P_matrix"]
 
     seed_indices: list[int] = []
+    seed_lookups: list[tuple] = []
     print(f"    Seed entities:")
     for qe in query_entities:
         qe_emb = embed(qe)
@@ -187,6 +189,7 @@ def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) ->
         best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
         print(f"      '{qe}' → KG node '{entities[best_idx]}' (sim={best_sim:.3f})")
+        seed_lookups.append((qe, entities[best_idx], best_sim))
         if best_idx not in seed_indices:
             seed_indices.append(best_idx)
 
@@ -195,7 +198,16 @@ def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) ->
     passage_scores = np.array(P_matrix.T.dot(weighted), dtype=np.float64).flatten()
 
     top_indices = np.argsort(-passage_scores)[:top_k]
-    return [(int(i), float(passage_scores[i])) for i in top_indices if passage_scores[i] > 0]
+    top_passages = [(int(i), float(passage_scores[i])) for i in top_indices if passage_scores[i] > 0]
+
+    return {
+        "q_ents": query_entities,
+        "seed_lookups": seed_lookups,
+        "seed_indices": seed_indices,
+        "ppr_scores": ppr,
+        "weighted": weighted,
+        "top_passages": top_passages,
+    }
 
 
 # =============================================================================
@@ -280,6 +292,14 @@ def main():
     vocab, passage_vecs = build_tfidf(PASSAGES)
     print(f"  TF-IDF vocab    : {len(vocab)} terms")
 
+    # ----- Phase 1c: write index overview -----
+    memory_ids = [m["id"] for m in ds["memories"]]
+    out_dir = prepare_output_dir("v1")
+    (out_dir / "index.md").write_text(
+        render_index_overview(index, "HippoRAG v1", memory_ids, PASSAGES)
+    )
+    print(f"\n  Wrote index overview → {out_dir / 'index.md'}")
+
     # ----- Phase 2: Retrieval -----
     print(f"\n{sep}")
     print("Phase 2 — Retrieval")
@@ -307,14 +327,19 @@ def main():
 
         # HippoRAG
         print(f"  [HippoRAG]")
-        hr = hipporag_retrieve(q_ents, index, top_k=TOP_K_ALL)
-        for rank, (pidx, score) in enumerate(hr[:TOP_K_ALL]):
+        trace = hipporag_retrieve(q_ents, index, top_k=TOP_K_ALL)
+        for rank, (pidx, score) in enumerate(trace["top_passages"][:TOP_K_ALL]):
             mark = "✓" if pidx in required else " "
             mid = ds["memories"][pidx]["id"]
             print(f"    [{mark}] #{rank+1:>2} {mid}  score={score:.5f}  "
                   f"\"{PASSAGES[pidx][:55]}...\"")
 
-        hr_top_ids = [pidx for pidx, _ in hr]
+        # Write per-question trace
+        (out_dir / f"{q['id']}_trace.md").write_text(
+            render_v1_trace(q, trace, index, memory_ids, PASSAGES, required)
+        )
+
+        hr_top_ids = [pidx for pidx, _ in trace["top_passages"]]
         hr_any, hr_all = score_retrieval(hr_top_ids, required, TOP_K_ANY, TOP_K_ALL)
         hr_per_q.append({"category": cat, "found_any": hr_any, "found_all": hr_all})
 

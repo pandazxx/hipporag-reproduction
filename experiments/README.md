@@ -8,8 +8,22 @@ by the NVIDIA NIM API. Layout:
 - [`demo_v2.py`](demo_v2.py) — HippoRAG 2 (Feb 2025, "main" branch)
 - [`_nim.py`](_nim.py) — shared NIM client + prompts (OpenIE, NER, recognition memory)
 - [`_dataset.py`](_dataset.py) — dataset loader + per-category scoring helpers
+- [`_viz.py`](_viz.py) — Mermaid renderers for the index graph and per-query traces
 - [`dataset.json`](dataset.json) — mirrored from
   [pandazxx/research:topics/llm-agent-memory/comparison-dataset](https://github.com/pandazxx/research/tree/topic/further-research-e1e53be/topics/llm-agent-memory/comparison-dataset)
+
+## Visual output
+
+Each demo run writes markdown files (with embedded Mermaid blocks) into
+`results/v1/` (or `results/v2/`):
+
+- `index.md` — phrase subgraph of the indexed memory, top phrases by degree
+- `qNN_trace.md` — one per question; shows seeds, search subgraph, retrieved
+  passages, and hit indicators
+
+These render directly on GitHub or in any Mermaid-aware Markdown viewer
+(VS Code, Obsidian, Typora). Mermaid was picked over Graphviz/HTML because it
+needs no extra runtime tools and produces diff-friendly text artifacts.
 
 ## Dataset
 
