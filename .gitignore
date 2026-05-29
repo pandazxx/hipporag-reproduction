@@ -50,6 +50,8 @@ vendor/
 
 # Project-specific
 results/raw/
+# results/v1/
+# results/v2/
 *.log
 *.cache
 .pytest_cache/

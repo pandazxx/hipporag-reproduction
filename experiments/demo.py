@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-HippoRAG end-to-end demo.
+HippoRAG (v1) end-to-end demo.
 
-Runs the full HippoRAG indexing + retrieval pipeline on a 15-passage dataset
-and compares it to naive TF-IDF dense retrieval. Demonstrates multi-hop advantage.
+Runs the full HippoRAG indexing + retrieval pipeline on the comparison dataset
+(40 chronologically ordered memories about a single user; 22 multi-category
+questions). Compares HippoRAG against a TF-IDF baseline; reports hit rates
+broken down by question category and against each category's expected winner.
 
 Deviations from the paper:
   [DEVIATION-4] ANN: brute-force numpy dot instead of FAISS IndexFlat.
@@ -23,60 +25,15 @@ from _nim import (
     embed, embed_batch,
     extract_triples, extract_query_entities,
 )
+from _dataset import (
+    load_dataset, passages, memory_id_to_idx, required_indices,
+    category_expected_winners, score_retrieval, aggregate_by_category,
+    format_summary,
+)
+from _viz import render_index_overview, render_v1_trace, prepare_output_dir
 
-
-# =============================================================================
-# DATASET: 15 passages about a fictional research lab
-# =============================================================================
-
-PASSAGES = [
-    "The Quantum Computing Lab was founded by Professor Alice Chen in 2010.",             # P0
-    "Professor Alice Chen has published over 200 papers on quantum error correction.",    # P1
-    "The Quantum Computing Lab is located at Stanford University.",                       # P2
-    "Stanford University is one of the top research universities in California.",         # P3
-    "Dr. Bob Martinez works at the Quantum Computing Lab on quantum algorithms.",         # P4
-    "Dr. Bob Martinez is supervised by Professor Alice Chen.",                            # P5
-    "Quantum algorithms are a key research area at MIT and Stanford University.",         # P6
-    "Professor Carol White is the director of the Physics department at Stanford University.",  # P7
-    "The Physics department at Stanford University hosts the Quantum Computing Lab.",     # P8
-    "Dr. Emily Davis recently joined the Quantum Computing Lab from Google Brain.",       # P9
-    "Google Brain is a research division of Google focused on deep learning.",            # P10
-    "Dr. Emily Davis works on quantum machine learning algorithms.",                      # P11
-    "Professor Alice Chen received the Turing Award in 2019.",                            # P12
-    "The Turing Award is given by the Association for Computing Machinery.",              # P13
-    "The Quantum Computing Lab received a $10M NSF grant in 2023.",                      # P14
-]
-
-TEST_QUESTIONS = [
-    {
-        "q":            "Who supervises the researcher working on quantum algorithms?",
-        "answer":       "Professor Alice Chen",
-        "hops":         2,
-        "chain":        "quantum algorithms → Dr. Bob Martinez → Professor Alice Chen",
-        "key_passages": {4, 5},
-    },
-    {
-        "q":            "What university hosts the lab that received the NSF grant?",
-        "answer":       "Stanford University",
-        "hops":         2,
-        "chain":        "NSF grant → Quantum Computing Lab → Stanford University",
-        "key_passages": {14, 2},
-    },
-    {
-        "q":            "What award did the founder of the lab where Dr. Bob Martinez works receive?",
-        "answer":       "Turing Award",
-        "hops":         3,
-        "chain":        "Dr. Bob Martinez → Quantum Computing Lab → Professor Alice Chen → Turing Award",
-        "key_passages": {4, 0, 12},
-    },
-    {
-        "q":            "What research field does the organization Dr. Emily Davis came from focus on?",
-        "answer":       "deep learning",
-        "hops":         2,
-        "chain":        "Dr. Emily Davis → Google Brain → deep learning",
-        "key_passages": {9, 10},
-    },
-]
+TOP_K_ANY = 5    # "any required fact retrieved in top-K_any?"
+TOP_K_ALL = 10   # "all required facts retrieved in top-K_all?"
 
 
 # =============================================================================
@@ -212,10 +169,10 @@ def personalized_pagerank(
 # HIPPORAG RETRIEVAL
 # =============================================================================
 
-def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) -> list[tuple]:
+def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) -> dict:
     """
-    Given query entity strings (extracted by NIM LLM), run PPR and return
-    (passage_idx, score) pairs sorted by score.
+    Given query entity strings (extracted by NIM LLM), run PPR and return a
+    trace dict with intermediate state for visualisation.
     """
     entities    = index["entities"]
     embeddings  = index["embeddings"]
@@ -224,6 +181,7 @@ def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) ->
     P_matrix    = index["P_matrix"]
 
     seed_indices: list[int] = []
+    seed_lookups: list[tuple] = []
     print(f"    Seed entities:")
     for qe in query_entities:
         qe_emb = embed(qe)
@@ -231,6 +189,7 @@ def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) ->
         best_idx = int(np.argmax(sims))
         best_sim = float(sims[best_idx])
         print(f"      '{qe}' → KG node '{entities[best_idx]}' (sim={best_sim:.3f})")
+        seed_lookups.append((qe, entities[best_idx], best_sim))
         if best_idx not in seed_indices:
             seed_indices.append(best_idx)
 
@@ -239,7 +198,16 @@ def hipporag_retrieve(query_entities: list[str], index: dict, top_k: int = 5) ->
     passage_scores = np.array(P_matrix.T.dot(weighted), dtype=np.float64).flatten()
 
     top_indices = np.argsort(-passage_scores)[:top_k]
-    return [(int(i), float(passage_scores[i])) for i in top_indices if passage_scores[i] > 0]
+    top_passages = [(int(i), float(passage_scores[i])) for i in top_indices if passage_scores[i] > 0]
+
+    return {
+        "q_ents": query_entities,
+        "seed_lookups": seed_lookups,
+        "seed_indices": seed_indices,
+        "ppr_scores": ppr,
+        "weighted": weighted,
+        "top_passages": top_passages,
+    }
 
 
 # =============================================================================
@@ -284,14 +252,23 @@ def tfidf_retrieve(query: str, vocab: dict, passage_vecs: np.ndarray, top_k: int
 # =============================================================================
 
 def main():
-    sep = "=" * 68
+    sep = "=" * 78
+
+    ds = load_dataset()
+    PASSAGES = passages(ds)
+    QUESTIONS = ds["questions"]
+    id_to_idx = memory_id_to_idx(ds)
+    expected = category_expected_winners(ds)
 
     print(sep)
-    print("HippoRAG End-to-End Demo  (NIM-backed)")
+    print("HippoRAG v1 End-to-End Demo  (NIM-backed)")
     print(sep)
-    print(f"\nCorpus: {len(PASSAGES)} passages  |  Questions: {len(TEST_QUESTIONS)}")
+    print(f"\nDataset: {ds['metadata']['name']}  v{ds['metadata']['version']}")
+    print(f"  {len(PASSAGES)} memories  |  {len(QUESTIONS)} questions  |  "
+          f"{len(expected)} categories")
     print(f"LLM    : {LLM_MODEL}")
     print(f"Embed  : {EMBED_MODEL}")
+    print(f"Top-K  : hit@{TOP_K_ANY}  |  all@{TOP_K_ALL}")
     print("\nRemaining deviation from the paper:")
     print("  [DEVIATION-4] ANN: brute-force numpy (not FAISS).")
 
@@ -303,7 +280,8 @@ def main():
     for i, passage in enumerate(PASSAGES):
         triples = extract_triples(passage)
         triples_per_passage[i] = triples
-        print(f"  P{i}: {len(triples)} triple(s)  {triples}")
+        mid = ds["memories"][i]["id"]
+        print(f"  {mid} (P{i}): {len(triples)} triple(s)")
 
     # ----- Phase 1b: Build index -----
     print(f"\n{sep}")
@@ -314,84 +292,88 @@ def main():
     vocab, passage_vecs = build_tfidf(PASSAGES)
     print(f"  TF-IDF vocab    : {len(vocab)} terms")
 
+    # ----- Phase 1c: write index overview -----
+    memory_ids = [m["id"] for m in ds["memories"]]
+    out_dir = prepare_output_dir("v1")
+    (out_dir / "index.md").write_text(
+        render_index_overview(index, "HippoRAG v1", memory_ids, PASSAGES)
+    )
+    print(f"\n  Wrote index overview → {out_dir / 'index.md'}")
+
     # ----- Phase 2: Retrieval -----
     print(f"\n{sep}")
     print("Phase 2 — Retrieval")
     print(sep)
 
-    hr_hit1 = 0
-    bl_hit1 = 0
-    hr_hit_all = 0
-    bl_hit_all = 0
+    hr_per_q: list[dict] = []
+    bl_per_q: list[dict] = []
 
-    for qi, q_data in enumerate(TEST_QUESTIONS):
-        q      = q_data["q"]
-        answer = q_data["answer"]
-        hops   = q_data["hops"]
-        chain  = q_data["chain"]
-        key_p  = q_data["key_passages"]
+    for qi, q in enumerate(QUESTIONS):
+        question = q["question"]
+        answer   = q["expected_answer"]
+        cat      = q["category"]
+        winner   = q["expected_winner"]
+        required = required_indices(q, id_to_idx)
+        req_ids  = q["requires_facts"]
 
-        print(f"\n{'─'*68}")
-        print(f"Q{qi+1} ({hops}-hop): {q}")
-        print(f"  Answer    : {answer}")
-        print(f"  Hop chain : {chain}")
-        print(f"  Key passages needed: {sorted(f'P{p}' for p in key_p)}")
+        print(f"\n{'─'*78}")
+        print(f"{q['id']} [{cat}, expect={winner}]: {question}")
+        print(f"  Answer   : {answer}")
+        print(f"  Required : {req_ids if req_ids else '(none — absence/abstention)'}")
 
         # NIM NER
-        q_ents = extract_query_entities(q)
-        print(f"  NIM NER   : {q_ents}")
+        q_ents = extract_query_entities(question)
+        print(f"  NIM NER  : {q_ents}")
 
         # HippoRAG
-        print(f"\n  [HippoRAG]")
-        hr = hipporag_retrieve(q_ents, index, top_k=5)
-        print(f"    Top-5 passages (PPR × specificity):")
-        for rank, (pidx, score) in enumerate(hr[:5]):
-            mark = "✓" if pidx in key_p else " "
-            print(f"      [{mark}] #{rank+1} P{pidx}  score={score:.5f}  "
-                  f"\"{PASSAGES[pidx][:60]}...\"")
+        print(f"  [HippoRAG]")
+        trace = hipporag_retrieve(q_ents, index, top_k=TOP_K_ALL)
+        for rank, (pidx, score) in enumerate(trace["top_passages"][:TOP_K_ALL]):
+            mark = "✓" if pidx in required else " "
+            mid = ds["memories"][pidx]["id"]
+            print(f"    [{mark}] #{rank+1:>2} {mid}  score={score:.5f}  "
+                  f"\"{PASSAGES[pidx][:55]}...\"")
 
-        hr_top3_set  = {pidx for pidx, _ in hr[:3]}
-        hr_top5_set  = {pidx for pidx, _ in hr[:5]}
-        hr_found1    = bool(key_p & hr_top3_set)
-        hr_found_all = key_p.issubset(hr_top5_set)
+        # Write per-question trace
+        (out_dir / f"{q['id']}_trace.md").write_text(
+            render_v1_trace(q, trace, index, memory_ids, PASSAGES, required)
+        )
+
+        hr_top_ids = [pidx for pidx, _ in trace["top_passages"]]
+        hr_any, hr_all = score_retrieval(hr_top_ids, required, TOP_K_ANY, TOP_K_ALL)
+        hr_per_q.append({"category": cat, "found_any": hr_any, "found_all": hr_all})
 
         # Baseline
-        print(f"\n  [Baseline — TF-IDF]")
-        bl = tfidf_retrieve(q, vocab, passage_vecs, top_k=5)
-        print(f"    Top-5 passages (cosine TF-IDF):")
-        for rank, (pidx, score) in enumerate(bl[:5]):
-            mark = "✓" if pidx in key_p else " "
-            print(f"      [{mark}] #{rank+1} P{pidx}  sim={score:.3f}  "
-                  f"\"{PASSAGES[pidx][:60]}...\"")
+        print(f"  [Baseline — TF-IDF]")
+        bl = tfidf_retrieve(question, vocab, passage_vecs, top_k=TOP_K_ALL)
+        for rank, (pidx, score) in enumerate(bl[:TOP_K_ALL]):
+            mark = "✓" if pidx in required else " "
+            mid = ds["memories"][pidx]["id"]
+            print(f"    [{mark}] #{rank+1:>2} {mid}  sim={score:.3f}    "
+                  f"\"{PASSAGES[pidx][:55]}...\"")
 
-        bl_top3_set  = {pidx for pidx, _ in bl[:3]}
-        bl_top5_set  = {pidx for pidx, _ in bl[:5]}
-        bl_found1    = bool(key_p & bl_top3_set)
-        bl_found_all = key_p.issubset(bl_top5_set)
+        bl_top_ids = [pidx for pidx, _ in bl]
+        bl_any, bl_all = score_retrieval(bl_top_ids, required, TOP_K_ANY, TOP_K_ALL)
+        bl_per_q.append({"category": cat, "found_any": bl_any, "found_all": bl_all})
 
-        hr_hit1    += int(hr_found1)
-        hr_hit_all += int(hr_found_all)
-        bl_hit1    += int(bl_found1)
-        bl_hit_all += int(bl_found_all)
-
-        hr_icon = "✓" if hr_found1 else "✗"
-        bl_icon = "✓" if bl_found1 else "✗"
-        print(f"\n  ≥1 key passage in top-3:  HippoRAG {hr_icon}  |  Baseline {bl_icon}")
+        def _icon(b):
+            return "—" if b is None else ("✓" if b else "✗")
+        print(f"  hit@{TOP_K_ANY}:  HippoRAG {_icon(hr_any)}  |  Baseline {_icon(bl_any)}    "
+              f"all@{TOP_K_ALL}: HippoRAG {_icon(hr_all)}  |  Baseline {_icon(bl_all)}")
 
     # ----- Summary -----
-    n = len(TEST_QUESTIONS)
     print(f"\n{sep}")
-    print("Summary")
+    print("Summary — HippoRAG")
     print(sep)
-    print(f"{'Metric':<42} {'HippoRAG':>10} {'Baseline':>10}")
-    print(f"{'─'*42} {'─'*10} {'─'*10}")
-    print(f"{'≥1 key passage in top-3':<42} {hr_hit1:>7}/{n:<3} {bl_hit1:>7}/{n}")
-    print(f"{'All key passages in top-5':<42} {hr_hit_all:>7}/{n:<3} {bl_hit_all:>7}/{n}")
+    print(format_summary(aggregate_by_category(hr_per_q), expected, TOP_K_ANY, TOP_K_ALL))
+    print(f"\n{sep}")
+    print("Summary — TF-IDF baseline")
+    print(sep)
+    print(format_summary(aggregate_by_category(bl_per_q), expected, TOP_K_ANY, TOP_K_ALL))
     print(sep)
     print()
-    print("Note: HippoRAG advantage comes from PPR propagating through the KG.")
-    print("      The baseline can only match passages whose text overlaps the query.")
-    print("      Multi-hop questions require following entity chains across passages.")
+    print("Note: absence_abstention questions have no requires_facts — they need a")
+    print("      QA reader to score and are reported under 'Skip' above.")
 
 
 if __name__ == "__main__":
